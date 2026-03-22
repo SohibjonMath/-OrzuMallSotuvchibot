@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
-from collections import defaultdict
+from functools import wraps
 
 from telegram import Update
 from telegram.ext import (
@@ -40,6 +40,7 @@ if SEND_MODE not in {"forward", "copy"}:
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 
+
 def parse_chat_id(value: str):
     value = value.strip()
     if value.startswith("@"):
@@ -48,6 +49,7 @@ def parse_chat_id(value: str):
         return int(value)
     except ValueError:
         return value
+
 
 SOURCE_CHAT_ID = parse_chat_id(SOURCE_CHAT_ID_RAW)
 TARGET_CHAT_ID = parse_chat_id(TARGET_CHAT_ID_RAW)
@@ -65,7 +67,7 @@ if ADMIN_IDS_RAW:
 # =========================
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger("album-repost-bot")
 
@@ -86,6 +88,7 @@ class Storage:
         {"item_id":"album_999888","sent_at":"..."}
       ]
     """
+
     def __init__(self, path: str):
         self.path = Path(path)
         self.data = {
@@ -111,7 +114,7 @@ class Storage:
     def save(self):
         self.path.write_text(
             json.dumps(self.data, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+            encoding="utf-8",
         )
 
     def get_item_by_id(self, item_id: str):
@@ -120,36 +123,54 @@ class Storage:
                 return item
         return None
 
-    def has_single(self, message_id: int) -> bool:
-        return self.get_item_by_id(f"single_{message_id}") is not None
+    def get_item_by_message_id(self, message_id: int):
+        for item in self.data["items"]:
+            if message_id in item.get("message_ids", []):
+                return item
+        return None
 
-    def has_album(self, media_group_id: str) -> bool:
-        return self.get_item_by_id(f"album_{media_group_id}") is not None
+    def remove_item_by_id(self, item_id: str) -> bool:
+        before = len(self.data["items"])
+        self.data["items"] = [x for x in self.data["items"] if x["id"] != item_id]
+        changed = len(self.data["items"]) != before
+        if changed:
+            self.save()
+        return changed
 
     def add_single(self, message_id: int) -> bool:
-        item_id = f"single_{message_id}"
-        if self.get_item_by_id(item_id):
+        existing = self.get_item_by_message_id(message_id)
+        if existing:
             return False
 
-        self.data["items"].append({
-            "id": item_id,
-            "type": "single",
-            "message_ids": [message_id],
-            "created_at": datetime.now(TZ).isoformat()
-        })
+        self.data["items"].append(
+            {
+                "id": f"single_{message_id}",
+                "type": "single",
+                "message_ids": [message_id],
+                "created_at": datetime.now(TZ).isoformat(),
+            }
+        )
         self.save()
         return True
 
     def upsert_album_message(self, media_group_id: str, message_id: int) -> bool:
         item_id = f"album_{media_group_id}"
         item = self.get_item_by_id(item_id)
+        changed = False
+
+        # Shu message ilgari single bo‘lib yozilgan bo‘lsa, o‘chirib yuboramiz.
+        single_id = f"single_{message_id}"
+        if self.get_item_by_id(single_id):
+            self.remove_item_by_id(single_id)
+            changed = True
+            logger.info("Single o‘chirildi, chunki albumga tegishli: %s", single_id)
 
         if not item:
             item = {
                 "id": item_id,
                 "type": "album",
                 "message_ids": [message_id],
-                "created_at": datetime.now(TZ).isoformat()
+                "created_at": datetime.now(TZ).isoformat(),
             }
             self.data["items"].append(item)
             self.save()
@@ -157,24 +178,53 @@ class Storage:
 
         if message_id not in item["message_ids"]:
             item["message_ids"].append(message_id)
-            item["message_ids"] = sorted(item["message_ids"])
-            self.save()
-            return True
+            item["message_ids"] = sorted(set(item["message_ids"]))
+            changed = True
 
-        return False
+        if changed:
+            self.save()
+        return changed
+
+    def cleanup_single_duplicates(self) -> dict:
+        album_message_ids = set()
+        for item in self.data["items"]:
+            if item.get("type") == "album":
+                album_message_ids.update(item.get("message_ids", []))
+
+        before = len(self.data["items"])
+        removed = []
+        kept = []
+
+        for item in self.data["items"]:
+            if item.get("type") == "single" and item.get("message_ids"):
+                msg_id = item["message_ids"][0]
+                if msg_id in album_message_ids:
+                    removed.append(item["id"])
+                    continue
+            kept.append(item)
+
+        self.data["items"] = kept
+        if removed:
+            self.save()
+
+        return {
+            "removed_count": len(removed),
+            "items_before": before,
+            "items_after": len(self.data["items"]),
+            "removed_ids": removed[:20],
+        }
 
     def all_items(self):
         return list(self.data["items"])
 
-    def item_count(self):
-        return len(self.data["items"])
-
     def mark_sent(self, item_id: str):
         self.data["last_sent_item_id"] = item_id
-        self.data["sent_history"].append({
-            "item_id": item_id,
-            "sent_at": datetime.now(TZ).isoformat()
-        })
+        self.data["sent_history"].append(
+            {
+                "item_id": item_id,
+                "sent_at": datetime.now(TZ).isoformat(),
+            }
+        )
         if len(self.data["sent_history"]) > 5000:
             self.data["sent_history"] = self.data["sent_history"][-5000:]
         self.save()
@@ -231,7 +281,9 @@ storage = Storage(DATA_FILE)
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_IDS) and user_id in ADMIN_IDS
 
+
 def admin_only(func):
+    @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if not user or not is_admin(user.id):
@@ -239,7 +291,10 @@ def admin_only(func):
                 await update.message.reply_text("Bu buyruq faqat admin uchun.")
             return
         return await func(update, context)
+
     return wrapper
+
+
 
 def format_times(raw: str):
     result = []
@@ -251,13 +306,18 @@ def format_times(raw: str):
         result.append(time(hour=int(hh), minute=int(mm), tzinfo=TZ))
     return result
 
+
 POST_TIMES = format_times(POST_TIMES_RAW)
+
+
 
 def is_source_chat(chat) -> bool:
     if isinstance(SOURCE_CHAT_ID, int):
         return chat.id == SOURCE_CHAT_ID
     username = f"@{chat.username}" if chat.username else None
     return username == SOURCE_CHAT_ID
+
+
 
 def pick_random_item():
     items = storage.all_items()
@@ -279,12 +339,14 @@ def pick_random_item():
 async def send_item(context: ContextTypes.DEFAULT_TYPE, item: dict) -> bool:
     bot = context.bot
     item_type = item["type"]
-    message_ids = sorted(item["message_ids"])
+    message_ids = sorted(set(item["message_ids"]))
     item_id = item["id"]
 
     try:
         if item_type == "album":
-            # Albumni birga yuborish
+            if len(message_ids) < 2:
+                logger.warning("Album item ichida 2 tadan kam message bor: %s", item_id)
+
             if SEND_MODE == "copy":
                 await bot.copy_messages(
                     chat_id=TARGET_CHAT_ID,
@@ -315,7 +377,6 @@ async def send_item(context: ContextTypes.DEFAULT_TYPE, item: dict) -> bool:
         storage.mark_sent(item_id)
         logger.info("Yuborildi: %s | type=%s | ids=%s", item_id, item_type, message_ids)
         return True
-
     except Exception as e:
         logger.warning("Yuborishda xato: %s | %s", item_id, e)
         return False
@@ -332,14 +393,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats - statistika\n"
         "/postnow - hozir random repost\n"
         "/importsingles 1 500 - eski oddiy post ID larni qo‘shish\n"
+        "/cleanupdupes - album ichiga tushib qolgan single larni tozalash\n"
         "/helpadmin - yordam\n\n"
         "Muhim:\n"
-        "• Yangi albumlar avtomatik to‘liq saqlanadi\n"
-        "• Eski albumlar oddiy range bilan to‘liq tiklanmaydi\n"
+        "• Yangi albumlar 1 ta post sifatida saqlanadi\n"
+        "• Album ichidagi rasmlar alohida single bo‘lib qolmaydi\n"
+        "• Eski /importsingles noto‘g‘ri kiritilgan albumlarni Telegram API bilan orqaga qarab aniq tiklab bo‘lmaydi\n"
         f"• Rejim: {SEND_MODE}\n"
         f"• Vaqtlar: {POST_TIMES_RAW}\n"
         f"• Takrorlamaslik: {NO_REPEAT_HOURS} soat"
     )
+
 
 @admin_only
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -356,6 +420,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Vaqtlar: {POST_TIMES_RAW}"
     )
 
+
 @admin_only
 async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     item = pick_random_item()
@@ -371,15 +436,16 @@ async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Yuborildi\n"
             f"Type: {item['type']}\n"
-            f"IDs: {item['message_ids']}"
+            f"IDs: {sorted(set(item['message_ids']))}"
         )
     else:
         await update.message.reply_text("❌ Yuborib bo‘lmadi.")
 
+
 @admin_only
 async def importsingles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Eski oddiy postlar uchun.
+    Faqat eski oddiy postlar uchun.
     Album strukturasini tiklamaydi.
     """
     if len(context.args) != 2:
@@ -398,16 +464,33 @@ async def importsingles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     added = 0
+    skipped = 0
     for msg_id in range(start_id, end_id + 1):
         if storage.add_single(msg_id):
             added += 1
+        else:
+            skipped += 1
 
     await update.message.reply_text(
         f"✅ importsingles tugadi\n"
-        f"Qo‘shildi: {added}\n\n"
+        f"Qo‘shildi: {added}\n"
+        f"O‘tkazib yuborildi: {skipped}\n\n"
         "Eslatma: bu faqat oddiy postlar uchun yaxshi.\n"
         "Eski albumlarni to‘liq tiklamaydi."
     )
+
+
+@admin_only
+async def cleanupdupes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = storage.cleanup_single_duplicates()
+    await update.message.reply_text(
+        "🧹 Tozalash tugadi\n\n"
+        f"Oldin: {result['items_before']}\n"
+        f"Keyin: {result['items_after']}\n"
+        f"O‘chirilgan duplicate single: {result['removed_count']}\n"
+        f"Namuna: {result['removed_ids']}"
+    )
+
 
 @admin_only
 async def help_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,14 +500,18 @@ async def help_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats\n"
         "/postnow\n"
         "/importsingles 1 500\n"
+        "/cleanupdupes\n"
         "/helpadmin\n\n"
         "Qanday ishlaydi:\n"
         "1) Botni source kanalga admin qilasiz\n"
         "2) Yangi oddiy post bo‘lsa single sifatida saqlaydi\n"
-        "3) Yangi album bo‘lsa media_group_id bilan to‘liq saqlaydi\n"
-        "4) Repost payti single yoki album bo‘lishiga qarab to‘g‘ri yuboradi\n\n"
+        "3) Yangi album bo‘lsa media_group_id bilan 1 ta post qilib saqlaydi\n"
+        "4) Album ichidagi har bir rasm alohida post bo‘lib ketmaydi\n"
+        "5) Repost payti single yoki album bo‘lishiga qarab to‘g‘ri yuboradi\n\n"
         "Muhim:\n"
-        "Eski albumlar uchun range import yetarli emas."
+        "• /cleanupdupes album ichiga tushib qolgan duplicate single larni tozalaydi\n"
+        "• /importsingles eski oddiy postlar uchun\n"
+        "• Oldin noto‘g‘ri import qilingan eski albumlarni avtomatik 100% tiklab bo‘lmaydi"
     )
 
 
@@ -439,18 +526,16 @@ async def capture_channel_posts(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_source_chat(msg.chat):
         return
 
-    # Album
     if msg.media_group_id:
         changed = storage.upsert_album_message(str(msg.media_group_id), msg.message_id)
         if changed:
             logger.info(
                 "Album saqlandi/yangilandi | media_group_id=%s | message_id=%s",
                 msg.media_group_id,
-                msg.message_id
+                msg.message_id,
             )
         return
 
-    # Oddiy post
     changed = storage.add_single(msg.message_id)
     if changed:
         logger.info("Single post saqlandi | message_id=%s", msg.message_id)
@@ -469,7 +554,6 @@ async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
     if ok:
         return
 
-    # fallback
     items = storage.all_items()
     random.shuffle(items)
     for alt in items[:20]:
@@ -491,12 +575,13 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("postnow", postnow_cmd))
     app.add_handler(CommandHandler("importsingles", importsingles_cmd))
+    app.add_handler(CommandHandler("cleanupdupes", cleanupdupes_cmd))
     app.add_handler(CommandHandler("helpadmin", help_admin_cmd))
 
     app.add_handler(
         MessageHandler(
             filters.ALL & filters.ChatType.CHANNEL,
-            capture_channel_posts
+            capture_channel_posts,
         )
     )
 
@@ -504,12 +589,13 @@ def main():
         app.job_queue.run_daily(
             scheduled_post,
             time=t,
-            name=f"post_{t.hour:02d}_{t.minute:02d}"
+            name=f"post_{t.hour:02d}_{t.minute:02d}",
         )
         logger.info("Jadval qo‘shildi: %02d:%02d", t.hour, t.minute)
 
     logger.info("Bot ishga tushdi...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
